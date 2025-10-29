@@ -109,7 +109,74 @@ This is not a new, unproven idea—it's the natural successor to a validated par
  :intent/status :verified}
 ```
 
-#### 6. **Staleness Entities** (Confidence Tracking)
+#### 6. **File Entities** (NEW: Eval Order Tracking)
+
+**Critical Insight**: Files represent an **ordered sequence of evaluations**, not just collections of definitions. Side effects and dependencies mean **sequence matters**.
+
+```clojure
+{:entity/type :file
+ :file/path "src/my/app.clj"
+ :file/namespace 'my.app
+ :file/statements [{:statement/id 1 :statement/type :def :statement/var 'config}
+                   {:statement/id 2 :statement/type :defn :statement/var 'process}
+                   {:statement/id 3 :statement/type :alter-var-root :statement/var 'config}
+                   {:statement/id 4 :statement/type :defn :statement/var 'process-slow}]
+ :file/eval-order [1 2 3 4]  ; Canonical sequence
+ :file/last-modified #inst "2024-10-29T15:30:00Z"
+ 
+ ;; Temporal tracking
+ :file/last-evaled #inst "2024-10-29T15:30:15Z"
+ :file/eval-lag-ms 15000      ; File changed but not re-evaled
+ :file/partial-eval? true     ; Some statements evaled individually in REPL
+ :file/confidence 0.65}       ; Runtime may differ from file
+```
+
+#### 7. **Statement/Form Entities** (NEW: Top-Level Forms)
+
+**The File-as-Sequence Problem**: Individual top-level forms have dependencies, side effects, and ordering constraints that must be tracked.
+
+```clojure
+{:entity/type :statement
+ :statement/id 42
+ :statement/file "src/my/app.clj"
+ :statement/namespace 'my.app
+ :statement/line 10
+ :statement/type :defn  ; or :def, :alter-var-root, :require, :side-effect
+ :statement/source "(defn process [x] ...)"
+ :statement/defines 'my.app/process  ; What var it creates/modifies
+ 
+ ;; Dependency tracking
+ :statement/depends-on ['my.app/config 'clojure.string/upper-case]
+ :statement/side-effects #{:io :var-mutation :state-change}
+ :statement/purity :pure | :pure-with-forward-declare | :impure
+ 
+ ;; Sequencing constraints
+ :statement/position 2          ; Position in file
+ :statement/must-follow [1]     ; Must eval after statement 1
+ :statement/can-reorder? false  ; Safe to eval in any order?
+ 
+ ;; Temporal tracking
+ :statement/last-evaled #inst "2024-10-29T15:30:00Z"
+ :statement/eval-count 3        ; Evaled 3 times (REPL experiments)
+ :statement/eval-source :repl-individual}  ; vs :file-load
+```
+
+**Side Effect Classification**:
+```clojure
+:statement/side-effects
+  #{:io              ; Reads/writes external data
+    :var-mutation    ; alter-var-root, def, defonce
+    :state-change    ; swap!, reset!, alter, etc.
+    :resource-creation  ; database connections, file handles
+    :require}        ; Loads other namespaces
+```
+
+**Purity Levels**:
+- **`:pure`** - No side effects, only defines var (can reorder freely)
+- **`:pure-with-forward-declare`** - Pure after forward declarations added
+- **`:impure`** - Has side effects, order-dependent
+
+#### 8. **Staleness Entities** (Confidence Tracking)
 ```clojure
 {:entity/type :staleness-info
  :staleness/scope     'my.app
@@ -122,7 +189,7 @@ This is not a new, unproven idea—it's the natural successor to a validated par
 
 ### The Entity Relationship Graph
 
-Enhanced with **confidence propagation**:
+Enhanced with **confidence propagation** and **eval order tracking**:
 
 ```clojure
 ;; Standard relationships
@@ -131,14 +198,21 @@ Enhanced with **confidence propagation**:
 :ns/requires       ; namespace -> namespace
 :ns/depends-on     ; namespace -> namespace (via actual usage)
 
-;; Temporal relationships (NEW)
+;; Temporal relationships
 :event/previous    ; event -> previous event (temporal chain)
 :event/triggered-by ; event -> causative event (causality)
 :event/affects     ; event -> affected entities
 
-;; Intent relationships (NEW)
+;; Intent relationships
 :intent/affects    ; intent -> entities
 :intent/achieved-by ; intent -> events that fulfilled it
+
+;; File/Statement relationships (NEW)
+:file/contains     ; file -> statements (ordered collection)
+:statement/in-file ; statement -> file
+:statement/defines ; statement -> var (what it creates/modifies)
+:statement/depends-on ; statement -> vars (what it uses)
+:statement/precedes   ; statement -> statement (eval order constraint)
 ```
 
 ## Query-Driven Insights with Confidence
@@ -272,6 +346,196 @@ Enhanced with **confidence propagation**:
 ;; Same entity graph, different perspectives
 ```
 
+## File & Statement Analysis: The REPL-vs-File Problem
+
+### The Core Challenge
+
+**Files represent ordered, deterministic evaluation**. **REPL sessions are exploratory and out-of-order**. This fundamental tension creates bugs that appear when code is reloaded.
+
+### Critical Query Patterns
+
+#### 1. **File-vs-Runtime Divergence Detection**
+```clojure
+;; Find namespaces where runtime state differs from file order
+'[:find ?ns ?file-order ?actual-order ?divergence
+  :where
+  [?file :file/namespace ?ns]
+  [?file :file/eval-order ?file-order]
+  
+  ;; Get actual eval order from events
+  [?event :event/type :statement-eval]
+  [?event :event/statement ?stmt]
+  [?stmt :statement/namespace ?ns]
+  [(actual-eval-sequence ?ns) ?actual-order]
+  
+  [(order-divergence ?file-order ?actual-order) ?divergence]
+  [(pos? ?divergence)]]
+
+;; Result with UI warning:
+{:namespace 'my.app
+ :divergence-count 2
+ :warnings
+ [{:type :out-of-order-eval
+   :file-position 2
+   :actual-position 1
+   :statement "(defn process ...)"
+   :risk :high
+   :message "Function evaled BEFORE its dependency 'config'"}
+  {:type :never-evaled
+   :file-position 3
+   :statement "(defn helper ...)"
+   :risk :medium
+   :message "File contains helper fn but never evaled in REPL"}]}
+```
+
+#### 2. **Side-Effect Detection**
+```clojure
+;; Find statements with side effects that were evaled out of order
+'[:find ?stmt ?expected-pos ?actual-pos ?side-effects
+  :where
+  [?stmt :statement/side-effects ?effects]
+  [(seq ?effects) true]  ; Has side effects
+  
+  [?stmt :statement/position ?expected-pos]
+  [?event :event/statement ?stmt]
+  [?event :event/sequence-id ?actual-seq]
+  [(position-from-sequence ?actual-seq) ?actual-pos]
+  
+  [(not= ?expected-pos ?actual-pos)]
+  [(= ?side-effects ?effects)]]
+
+;; UI Display:
+⚠️  Side-effectful statements evaled out of order:
+
+1. (def config (read-config))     Expected: pos 1, Actual: pos 3
+   Side effects: [:io]
+   Risk: Config read AFTER process fn defined - process may use stale data
+
+2. (alter-var-root #'config ...)  Expected: pos 3, Actual: pos 2
+   Side effects: [:var-mutation]
+   Risk: Config mutated before process fn defined
+```
+
+#### 3. **Missing Forward Declarations**
+```clojure
+;; Find vars that could benefit from forward declarations
+'[:find ?stmt ?missing-declare ?used-before-defined
+  :where
+  [?stmt :statement/defines ?var]
+  [?stmt :statement/position ?def-pos]
+  
+  ;; Find statements that use this var
+  [?use-stmt :statement/depends-on ?var]
+  [?use-stmt :statement/position ?use-pos]
+  
+  ;; Used before defined
+  [(< ?use-pos ?def-pos)]
+  
+  ;; No declare exists
+  (not [?decl :statement/type :declare]
+       [?decl :statement/defines ?var])
+  
+  [(= ?missing-declare ?var)]
+  [(= ?used-before-defined ?use-stmt)]]
+
+;; Recommendation:
+Add forward declarations to enable safe reordering:
+
+(declare process helper validate)
+
+This allows REPL experimentation without order constraints.
+```
+
+#### 4. **Reorder Safety Analysis**
+```clojure
+;; Which statements can be safely reordered?
+'[:find ?stmt ?reorder-safe?
+  :where
+  [?stmt :statement/type ?type]
+  
+  ;; Check purity
+  [?stmt :statement/purity ?purity]
+  [?stmt :statement/side-effects ?effects]
+  
+  ;; Check if all dependencies could be forward-declared
+  [?stmt :statement/depends-on ?deps]
+  [(all-declarable? ?deps) ?all-decl]
+  
+  ;; Safe if pure OR pure-with-declares AND no side effects
+  [(or (= ?purity :pure)
+       (and (= ?purity :pure-with-forward-declare)
+            ?all-decl
+            (empty? ?effects))) ?reorder-safe?]]
+```
+
+#### 5. **Session Reproducibility Check**
+```clojure
+;; Can I reproduce my current REPL state by reloading the file?
+'[:find ?ns ?reproducible? ?blocking-issues
+  :where
+  [?file :file/namespace ?ns]
+  [?file :file/eval-order ?file-order]
+  
+  ;; Get REPL eval events
+  [(repl-eval-sequence ?ns) ?repl-order]
+  
+  ;; Check if reloading file would produce same state
+  [(order-compatible? ?file-order ?repl-order) ?compatible]
+  [(find-blocking-issues ?file-order ?repl-order) ?issues]
+  
+  [(and ?compatible (empty? ?issues)) ?reproducible?]
+  [(= ?blocking-issues ?issues)]]
+
+;; Result:
+{:namespace 'my.app
+ :reproducible? false
+ :blocking-issues
+ [{:type :out-of-order-dependency
+   :statement "(defn process [x] (helper x))"
+   :problem "Calls helper before helper is defined in file"
+   :fix "Add (declare helper) before process"}
+  {:type :missing-side-effect
+   :statement "(alter-var-root #'config assoc :timeout 5000)"
+   :problem "REPL has mutated config, but file doesn't reflect this"
+   :fix "Update file to match REPL state or remove mutation"}]}
+```
+
+### UI Patterns for File/Statement Issues
+
+**Real-time Warning in Editor**:
+```
+my/app.clj [⚠️ Runtime divergence detected]
+
+Line 15: (defn process [x] (helper x))
+         ⚠️  Calls 'helper' before it's defined (line 20)
+         💡 Add: (declare helper) at line 10
+         🔴 REPL evaled this BEFORE helper was defined - may fail on reload
+
+Line 20: (defn helper [x] (* x 2))
+         ✅ Definition matches REPL state
+         
+Line 25: (alter-var-root #'config assoc :timeout 5000)
+         ⚠️  REPL skipped this statement
+         🔴 File config differs from runtime config
+```
+
+**Pre-Reload Sanity Check**:
+```
+About to reload my.app namespace...
+
+Checking for issues:
+✅ No missing forward declarations
+⚠️  3 statements have side effects
+   → (def config (read-config))  [re-runs I/O]
+   → (defonce db (create-db))    [won't re-run due to defonce]
+   → (println "Loading...")      [will print again]
+
+❌ 2 out-of-order dependencies detected
+   → process uses helper before helper defined
+
+Recommendation: Fix order issues before reloading
+```
+
 ## Enhanced Use Cases (Feedback-Informed)
 
 ### 1. **Development Workflow**
@@ -282,6 +546,8 @@ Enhanced with **confidence propagation**:
 | **Temporal Regression Hunting** | Causality chain | Given failing test, find root cause change via event correlation |
 | **Blast Radius Estimation** | Impact + velocity | Quantify refactoring risk: dependents × change rate |
 | **Pre-commit Sanity Check** | Confidence threshold | Block commit if critical analyses have confidence < 0.8 |
+| **File-vs-REPL Divergence** (NEW) | Statement order | Detect when REPL state won't reproduce from file reload |
+| **Reorder Safety Analysis** (NEW) | Purity + dependencies | Identify statements safe to reorder with forward declares |
 
 ### 2. **Architecture & Quality**
 
@@ -438,11 +704,40 @@ Enhanced with **confidence propagation**:
    :event/cascade-depth {:db/index true}              ; nth-order effects
    :event/sequence-id   {:db/index true}              ; temporal ordering
    
-   ;; Intent entities (NEW: human context)
+   ;; Intent entities (human context)
    :intent/author   {:db/index true}
    :intent/affected-entities {:db/valueType :db.type/ref
                               :db/cardinality :db.cardinality/many}
    :intent/status   {:db/index true}
+   
+   ;; File entities (NEW: eval order tracking)
+   :file/path       {:db/unique :db.unique/identity :db/index true}
+   :file/namespace  {:db/valueType :db.type/ref}
+   :file/statements {:db/valueType :db.type/ref
+                     :db/cardinality :db.cardinality/many
+                     :db/isComponent true}  ; Owned by file
+   :file/eval-order {:db/cardinality :db.cardinality/many}  ; Ordered list
+   :file/last-modified {:db/index true}
+   :file/last-evaled   {:db/index true}
+   :file/partial-eval? {:db/index true}
+   
+   ;; Statement entities (NEW: top-level forms)
+   :statement/id    {:db/unique :db.unique/identity}
+   :statement/file  {:db/valueType :db.type/ref}
+   :statement/namespace {:db/valueType :db.type/ref}
+   :statement/type  {:db/index true}  ; :defn, :def, :alter-var-root, etc.
+   :statement/defines {:db/valueType :db.type/ref}  ; var it creates
+   :statement/depends-on {:db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/many}
+   :statement/side-effects {:db/cardinality :db.cardinality/many}  ; set of keywords
+   :statement/purity {:db/index true}  ; :pure, :pure-with-forward-declare, :impure
+   :statement/position {:db/index true}  ; position in file
+   :statement/must-follow {:db/valueType :db.type/ref
+                           :db/cardinality :db.cardinality/many}
+   :statement/can-reorder? {:db/index true}
+   :statement/last-evaled  {:db/index true}
+   :statement/eval-count   {:db/index true}
+   :statement/eval-source  {:db/index true}  ; :repl-individual, :file-load
    
    ;; Staleness tracking
    :staleness/scope {:db/valueType :db.type/ref}
@@ -578,7 +873,29 @@ Enhanced with **confidence propagation**:
 | **User Personas** | One size fits all | Multiple views/lenses |
 | **AI Integration** | Not designed for it | LLM-friendly from day one |
 
-**Unique Value Proposition**: clj-surveyor is the only tool that combines runtime-first entity modeling, temporal awareness with confidence tracking, and queryable relationship graphs—making it ideal for both human developers and AI-augmented workflows.
+**Unique Value Proposition**: clj-surveyor is the only tool that combines runtime-first entity modeling, temporal awareness with confidence tracking, queryable relationship graphs, and **file-vs-REPL divergence detection**—making it ideal for both human developers and AI-augmented workflows.
+
+---
+
+## Key Innovations Summary
+
+### 1. **Runtime-First with Temporal Honesty**
+Most tools pretend perfect knowledge. clj-surveyor acknowledges imperfection, tracks staleness, and propagates confidence through every query.
+
+### 2. **FQN-Based True Dependencies**
+Distinguishes between `require` (convenience) and actual symbol usage (true dependencies), enabling accurate impact analysis.
+
+### 3. **Event-Driven Causality Tracking**
+Not just "what changed" but "what triggered this cascade of changes"—critical for temporal regression hunting.
+
+### 4. **File-as-Sequence Model** (NEW)
+Recognizes that files are ordered evaluations with side effects. Tracks eval order, detects REPL-vs-file divergence, identifies when "works in my REPL" won't survive reload.
+
+### 5. **Multiple Lenses on Same Graph**
+Different views (dependency, temporal, architectural, component) for different user personas—same entity data, different perspectives.
+
+### 6. **AI-Augmented Ready**
+Entity serialization designed for LLM consumption, positioning clj-surveyor as the "code understanding layer" for AI-powered development tools.
 
 ---
 
