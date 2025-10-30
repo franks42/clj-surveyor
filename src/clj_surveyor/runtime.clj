@@ -127,6 +127,45 @@
        :functions (count (filter (comp fn? var-get) all-vars))
        :dynamics (count (filter (comp :dynamic meta) all-vars))})))
 
+(defn build-dependency-graph
+  "Analyze all loaded namespaces and build a complete dependency graph.
+   Returns a map of {var-fqn {:dependents #{...} :dependencies #{...}}}.
+   
+   Phase 0 approach: Uses clj-kondo to analyze all loaded namespaces.
+   Only includes vars that have source code available (file-based or middleware-captured).
+   
+   Options:
+   - :ns-filter - regex pattern to filter namespaces (default: analyze all)
+   
+   Example:
+   (build-dependency-graph)
+   (build-dependency-graph {:ns-filter #\"^my-project\"})"
+  ([] (build-dependency-graph {}))
+  ([{:keys [ns-filter]}]
+   (let [all-namespaces (if ns-filter
+                          (filter #(re-find ns-filter (str (ns-name %))) (all-ns))
+                          (all-ns))
+         ;; Analyze each namespace and collect var-usages
+         ns-analyses (keep (fn [ns-obj]
+                            (when-let [analysis (analyze-namespace-code ns-obj)]
+                              {:ns (ns-name ns-obj)
+                               :var-usages (:var-usages analysis)}))
+                          all-namespaces)]
+     ;; Process all var-usages to build bidirectional dependency graph
+     (reduce (fn [graph {:keys [var-usages]}]
+               (reduce (fn [g usage]
+                         (let [caller-fqn (str (:from usage) "/" (:from-var usage))
+                               callee-fqn (str (:to usage) "/" (:name usage))]
+                           (-> g
+                               ;; Add to dependents of callee (who calls me?)
+                               (update-in [callee-fqn :dependents] (fnil conj #{}) caller-fqn)
+                               ;; Add to dependencies of caller (who do I call?)
+                               (update-in [caller-fqn :dependencies] (fnil conj #{}) callee-fqn))))
+                       graph
+                       var-usages))
+             {}
+             ns-analyses))))
+
 (defn runtime-snapshot
   "Capture a snapshot of the current runtime state.
    Phase 0: Basic counts and namespace list."
@@ -146,8 +185,17 @@
   ;; Get info about map
   (var-info #'clojure.core/map)
   
-  ;; Find dependents of map (Phase 0 heuristic)
+  ;; Find dependents of a specific var
   (get-var-dependents "clojure.core/map")
+  
+  ;; Build complete dependency graph
+  (def graph (build-dependency-graph))
+  (get graph "test.demo-file/helper-fn")
+  ;; => {:dependents #{"test.demo-file/caller-1" "test.demo-file/caller-2"}
+  ;;     :dependencies #{}}
+  
+  ;; Build graph for specific namespaces only
+  (build-dependency-graph {:ns-filter #"^clj-surveyor"})
   
   ;; Get namespace summary
   (namespace-summary "clojure.core")
