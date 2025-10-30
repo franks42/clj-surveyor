@@ -76,9 +76,8 @@
    Returns seq of {:user-fqn ... :ref-type ... :from-var ... :to-var ...}
    Confidence: :high (static analysis)"
   [target-var]
-  (let [target-fqn (var-fqn target-var)
-        target-ns (.ns target-var)
-        target-name (symbol (name target-fqn))]
+  (let [target-ns (.ns target-var)
+        target-name (.sym target-var)]  ;; Just the symbol name, e.g. 'helper-fn
     ;; Analyze the namespace with clj-kondo
     (when-let [analysis (analyze-namespace-code target-ns)]
       (let [var-usages (:var-usages analysis)]
