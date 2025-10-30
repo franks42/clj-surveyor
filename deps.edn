@@ -1,0 +1,5 @@
+{:paths ["src" "dev" "tmp/clj-ns-browser-master" "tmp/clj-info-master"]
+ :deps {clj-ns-browser/clj-ns-browser {:local/root "tmp/clj-ns-browser-master"}
+        clj-info/clj-info             {:local/root "tmp/clj-info-master"}}
+ :aliases {:dev {:extra-paths ["dev"]}}
+}

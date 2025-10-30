@@ -42,6 +42,11 @@ This is not a new, unproven idea—it's the natural successor to a validated par
  :var/macro?  false
  :var/private? false
  
+ ;; Persistence tracking (NEW)
+ :var/file-backed?  true                    ; Defined in a file?
+ :var/ephemeral?    false                   ; REPL-only definition?
+ :var/file-diverged? false                  ; REPL value differs from file?
+ 
  ;; Temporal tracking
  :entity/captured-at    #inst "2024-10-29T15:30:15.123Z"
  :entity/staleness-ms   1247
@@ -76,23 +81,64 @@ This is not a new, unproven idea—it's the natural successor to a validated par
 
 **Key Enhancement**: Generalize beyond var changes to capture full development lifecycle.
 
+**Critical Insight**: File loading and statement evaluation are both **event sequences**. Loading a file is just a batch eval of ordered statements. REPL eval is granular, often out-of-order. Every eval event potentially invalidates dependents, but determining **which dependents need re-eval** and **how far the cascade should go** is the fundamental challenge.
+
 ```clojure
 {:entity/type :event
- :event/type  #{:var-redefinition :test-run :require-invoked 
-                :load-file :profiling-sample :repl-command}
- :event/target      'my.app/process-user
- :event/timestamp   #inst "2024-10-29T15:30:00.456Z"
- :event/source      :repl-eval
+ :event/type  #{:file-load           ; Batch eval of all statements in order
+                :statement-eval       ; Single statement eval (REPL)
+                :namespace-reload     ; Explicit reload (may skip defonce)
+                :var-redefinition     ; def/defn overwrites existing var
+                :test-run             ; Test execution
+                :require-invoked      ; Dependency loaded
+                :profiling-sample     ; Performance data
+                :repl-command}        ; User interaction
  
- ;; Causality tracking (NEW)
+ :event/target      'my.app/process-user  ; What was affected
+ :event/timestamp   #inst "2024-10-29T15:30:00.456Z"
+ :event/source      :repl-eval | :file-load | :ns-reload
+ 
+ ;; Persistence tracking (NEW)
+ :event/persistent? true                    ; Saved to file?
+ :event/file-backed "src/my/app.clj"        ; If persistent
+ :event/ephemeral?  false                   ; REPL-only, will revert on restart
+ 
+ ;; For file-load events (NEW)
+ :event/file        "src/my/app.clj"
+ :event/statements  [{:id 1} {:id 2} {:id 3}]  ; Ordered sequence evaled
+ :event/eval-order  [1 2 3]                    ; Canonical file order
+ 
+ ;; For statement-eval events (NEW)
+ :event/statement   {:db/valueType :db.type/ref}  ; Which statement
+ :event/position    2                              ; Where in file
+ :event/out-of-order? true                        ; Evaled before dependencies?
+ 
+ ;; Impact tracking (NEW)
+ :event/affected-vars       [{:db/valueType :db.type/ref}]  ; Direct impact
+ :event/stale-dependents    23                              ; Vars now stale
+ :event/cascade-needed?     true                            ; Should propagate?
+ :event/cascade-confidence  0.7                             ; How sure?
+ :event/cascade-depth       3                               ; How far to go?
+ 
+ ;; Causality tracking
  :event/triggered-by    {:db/valueType :db.type/ref}  ; parent event
- :event/cascade-depth   3                             ; nth-order effect
+ :event/cascade-from    {:db/valueType :db.type/ref}  ; original change
  :event/causality-confidence 0.8
  
  ;; Temporal context
  :event/detection-lag   23      ; ms between actual change and detection
  :event/sequence-id     1247}   ; order in event stream
 ```
+
+**The Cascade Dilemma**:
+
+When you eval `(def config {:timeout 60})` and it has 23 transitive dependents, **do all 23 need re-eval?** The honest answer: **we can't know for certain**.
+
+- **Best case**: Config change doesn't semantically affect dependents (e.g., just a timeout value)
+- **Worst case**: Every dependent's behavior changed, all need re-eval and re-test
+- **Reality**: Somewhere in between, depends on actual code semantics
+
+**clj-surveyor's approach**: Track the cascade potential, show the user, let them decide—but provide confidence indicators to guide the decision.
 
 #### 5. **Intent Entities** (NEW: Human-in-the-Loop)
 
@@ -148,7 +194,8 @@ This is not a new, unproven idea—it's the natural successor to a validated par
  ;; Dependency tracking
  :statement/depends-on ['my.app/config 'clojure.string/upper-case]
  :statement/side-effects #{:io :var-mutation :state-change}
- :statement/purity :pure | :pure-with-forward-declare | :impure
+ :statement/purity :pure | :pure-isolated | :impure-var-with-deps | :impure-known
+ :statement/downstream-impact 23  ; Number of vars affected if this statement changes
  
  ;; Sequencing constraints
  :statement/position 2          ; Position in file
@@ -164,17 +211,51 @@ This is not a new, unproven idea—it's the natural successor to a validated par
 **Side Effect Classification**:
 ```clojure
 :statement/side-effects
-  #{:io              ; Reads/writes external data
-    :var-mutation    ; alter-var-root, def, defonce
-    :state-change    ; swap!, reset!, alter, etc.
+  #{:io                 ; Reads/writes external data
+    :var-mutation       ; alter-var-root, def, defonce
+    :state-change       ; swap!, reset!, alter, etc.
     :resource-creation  ; database connections, file handles
-    :require}        ; Loads other namespaces
+    :require}           ; Loads other namespaces
 ```
 
-**Purity Levels**:
-- **`:pure`** - No side effects, only defines var (can reorder freely)
+**Purity Levels** (Dependency-Aware):
+
+The critical insight: **var assignment is only "pure" if nothing depends on that var**. Otherwise, the assignment is a side effect that propagates through the entire dependency graph.
+
+- **`:pure-isolated`** - Pure computation with no var assignment
+  - `(comment (+ 1 2 3))` - REPL experiments
+  - `(assert (= 2 (+ 1 1)))` - Inline tests
+  - No state mutation, safe to eval any time
+  - **Confidence**: HIGH (static analysis)
+
+- **`:pure`** - Var definition with **zero dependents**
+  - `(def config 42)` - nothing uses it yet
+  - `(defn helper [x] (* x 2))` - not called anywhere
+  - Safe to reorder because no downstream impact
+  - **Confidence**: HIGH (query dependency graph)
+
 - **`:pure-with-forward-declare`** - Pure after forward declarations added
-- **`:impure`** - Has side effects, order-dependent
+  - `(defn process [x] (helper x))` where helper defined later
+  - Needs `(declare helper)` to enable reordering
+  - **Confidence**: HIGH (static analysis + graph)
+
+- **`:impure-var-with-deps`** - Var assignment affecting dependents
+  - `(def foo 42)` where other code uses `foo`
+  - `(defn bar [x] ...)` redefining function in active use
+  - **Impact**: All dependents now stale, REPL diverged from file
+  - **Side Effect**: Mutation propagates through dependency graph
+  - **Confidence**: HIGH (traverse dependency graph for dependents)
+
+- **`:impure-var-unknown-deps`** - Var assignment, dependencies unclear
+  - `(def foo 42)` but dependency analysis incomplete
+  - Assume impure until proven otherwise (safe default)
+  - **Confidence**: MEDIUM (incomplete graph)
+
+- **`:impure-known`** - I/O, state mutation, resource creation
+  - `(println "Loading...")` - I/O side effect
+  - `(reset! atom-val 42)` - State mutation
+  - `(create-database-connection)` - Resource creation
+  - **Confidence**: HIGH (static analysis detects known patterns)
 
 #### 8. **Staleness Entities** (Confidence Tracking)
 ```clojure
@@ -352,9 +433,403 @@ Enhanced with **confidence propagation** and **eval order tracking**:
 
 **Files represent ordered, deterministic evaluation**. **REPL sessions are exploratory and out-of-order**. This fundamental tension creates bugs that appear when code is reloaded.
 
+### The Dependency-Aware Side-Effect Model
+
+**Critical Insight**: A var assignment like `(def foo 42)` isn't inherently "pure" just because it doesn't do I/O. **If any other code depends on that var, the assignment is a side effect that propagates through the entire dependency graph**.
+
+**The Cascade Problem**: When you redefine a var with dependents, **how many need re-eval?** And **how do we know?** This is the fundamental uncertainty of REPL-driven development.
+
+#### The Miracle of Working Software
+
+It's actually remarkable that our software works at all. Consider:
+
+1. **File load**: Eval 50 statements in order → 50 vars defined
+2. **REPL experiment**: Eval statement #30 in isolation → 1 var redefined
+3. **Cascade question**: Which of the other 49 statements are now invalid?
+
+**We can't know with certainty**. We can:
+- Track **syntactic dependencies** (what calls what)
+- Detect **temporal staleness** (what changed when)
+- Estimate **impact radius** (how many affected)
+- Classify **purity levels** (side-effect potential)
+
+But **semantic equivalence**? ("Does this change actually matter?") That requires understanding code meaning, which is AI-hard.
+
+**The Deeper Problem: Runtime Call Tracking**
+
+Even if we know `function-b` depends on `var-a`, we face an even harder problem:
+
+```clojure
+(def config {:timeout 30})
+
+(defn process [x]
+  (with-timeout (:timeout config)  ; Closes over config's VALUE
+    (validate x)))
+
+;; Later in REPL:
+(def config {:timeout 60})         ; Redefine config
+
+;; Question: Does process need re-eval?
+;; Answer: Depends on WHEN it was called!
+```
+
+**The intractable questions**:
+1. **Was `process` ever called?** (If not, re-eval doesn't matter yet)
+2. **When was it last called?** (Before or after config changed?)
+3. **By whom?** (Which caller invoked it? With what args?)
+4. **Did the call capture the old or new config value?**
+5. **Does it even matter?** (If timeout change doesn't affect behavior)
+6. **Did the value change cause different code paths?** (Conditional branching we can't predict)
+
+**The Branching Problem**:
+
+Changing a var's value can cause the entire application to take a completely different execution path:
+
+```clojure
+(def feature-flags {:new-algorithm-enabled? false})
+
+(defn process [data]
+  (if (:new-algorithm-enabled? feature-flags)
+    (new-fast-algorithm data)      ; Path A: never executed before
+    (old-slow-algorithm data)))    ; Path B: always executed
+
+;; Later in REPL:
+(def feature-flags {:new-algorithm-enabled? true})
+
+;; Now process will call new-fast-algorithm
+;; - Which may not even be loaded yet
+;; - Which may have different dependencies
+;; - Which may behave completely differently
+;; - Which creates a whole new dependency subgraph we haven't analyzed
+```
+
+**We can't predict**:
+- Which code paths will execute with new values
+- What dependencies those paths will need
+- Whether those dependencies are even loaded/defined
+- What side effects the new paths will trigger
+- How control flow changes ripple through the system
+
+Even with perfect call tracking, we'd need **symbolic execution** or **runtime profiling** to know which branches are taken with different values.
+
+**clj-surveyor cannot track runtime invocations or control flow**. We can't know:
+- Which functions were actually called
+- When they were called relative to var changes
+- What values they captured from the environment
+- Whether stale closures are still alive in the runtime
+- **Which code paths will execute with changed values**
+- **What new dependencies emerge from conditional branches**
+
+This would require **invasive runtime instrumentation** (every function call logged, every branch tracked) with massive performance overhead and memory requirements.
+
+**What we CAN do (static analysis)**:
+- ✅ Track var definitions and redefinitions (via `add-watch`)
+- ✅ Detect syntactic dependencies (what symbols appear in function bodies)
+- ✅ Build dependency graph (who calls whom - static structure)
+- ✅ Timestamp changes to detect staleness windows
+- ✅ Classify purity to estimate side-effect scope
+- ✅ Identify potential branching points (if/case/cond forms)
+
+**What we CANNOT do (without runtime tracing)**:
+- ❌ Know if a function was called after a var change
+- ❌ Track which values were captured in closures
+- ❌ Detect stale references in long-lived objects
+- ❌ Trace call chains through the runtime
+- ❌ Determine if staleness actually affects behavior
+- ❌ **Predict which code paths will execute with new values**
+- ❌ **Know what dependencies emerge from conditional branches**
+- ❌ **Detect when value changes cause control flow shifts**
+- ❌ **Track application state** (web servers, connections, caches, atoms, refs)
+- ❌ **Find stale closures in running systems** (returned from previous calls)
+
+**clj-surveyor's honest approach**:
+- Show the dependency graph (static structure)
+- Flag **potential** staleness (temporal windows)
+- Provide confidence indicators based on what we **can** know
+- Identify branching points where control flow depends on var values
+- **Acknowledge uncertainty** - we show possibilities, not guarantees
+- **Surface the unknowable** - make explicit what we can't determine
+- **Let the human decide** based on domain knowledge
+
+**The Layered State Problem**:
+
+A running Clojure system has multiple layers of state, each requiring different refresh strategies:
+
+| State Layer | What Lives Here | Refresh Strategy | Staleness Risk |
+|-------------|----------------|------------------|----------------|
+| **File-Backed Definitions** | Saved .clj files | Reload from disk | ✅ Persistent, survives restart |
+| **REPL-Only Definitions** | Ad-hoc evals not saved | Re-eval manually | ⚠️ Ephemeral, lost on restart |
+| **Namespace State** | requires, imports | Reload namespace | ✅ clj-surveyor can detect |
+| **Application State** | Web servers, DB pools | Restart app or re-init | ❌ Can't detect from definitions |
+| **Runtime Objects** | Closures, cached values | Recreate objects | ❌ Invisible to static analysis |
+| **External Systems** | Databases, files, queues | Re-initialize | ❌ Outside Clojure entirely |
+
+**Critical Distinction: Persistent vs. Ephemeral Changes**
+
+1. **Persistent changes** (saved to files):
+   - Survive application restart
+   - Reflected in version control
+   - Affect all future sessions
+   - Example: `(defn process [x] ...)` saved in `my/app.clj`
+
+2. **Ephemeral changes** (REPL-only evals):
+   - Lost on REPL restart
+   - Not in version control
+   - Experimental, temporary
+   - Example: `(def config {:timeout 9999})` evaled but not saved
+   
+**The Divergence Problem**:
+
+When you have both persistent (file) and ephemeral (REPL-only) changes, you have **three different states**:
+
+```clojure
+;; State 1: FILE (on disk)
+(def config {:timeout 30})
+
+;; State 2: REPL (in memory, after experimenting)
+(def config {:timeout 9999})  ; Changed but not saved!
+
+;; State 3: APP (after restart)
+(def config {:timeout 30})    ; Reverts to file state, ephemeral change lost
+```
+
+**clj-surveyor's approach**:
+
+- Track **both** file-backed and REPL-only definitions
+- Flag divergence: "config in REPL differs from file"
+- Mark changes as `:persistent` or `:ephemeral` based on file presence
+- Warn: "Ephemeral change will be lost on restart unless saved to file"
+
+**Refresh strategies by change type**:
+
+| Change Type | Where | Refresh Method | Persists After Restart? |
+|-------------|-------|----------------|------------------------|
+| Saved file edit | Disk | Reload file | ✅ Yes |
+| REPL ad-hoc eval | Memory | Re-query/re-eval | ❌ No - reverts to file |
+| REPL + saved | Both | Already persistent | ✅ Yes |
+
+**REPL doesn't need restart** - it just needs to re-query for changed values and update its dependency analysis. But developers need to know which changes are ephemeral vs. persistent.
+
+Because sometimes you *know* the change is safe (just a docstring). Sometimes you know it's dangerous (core algorithm). Sometimes you know which code path will execute (feature flag you control). And sometimes you know the function hasn't been called yet, so staleness doesn't matter.
+
+The tool provides the best evidence we can gather without runtime tracing. The developer makes the call using knowledge the tool can't have.
+
+**Example: Feature Flag Awareness** (Potential Enhancement)
+
+```clojure
+;; We could detect conditional dependencies statically:
+(defn analyze-conditional-deps [fn-source]
+  {:static-deps     #{old-slow-algorithm}  ; Always referenced syntactically
+   :conditional-deps {true  #{new-fast-algorithm}   ; Only if flag true
+                      false #{old-slow-algorithm}}  ; Only if flag false
+   :control-var     'feature-flags
+   :warning "Function behavior depends on feature-flags value.
+             Changing feature-flags will alter code path at runtime.
+             We cannot predict which path will execute."})
+```
+
+This gives developers a heads-up that changing `feature-flags` has **unpredictable impact** beyond the static dependency graph.
+
+#### Why Var Assignment = Side Effect (When It Has Dependents)
+
+```clojure
+;; File: my/app.clj
+
+(def config {:timeout 30})        ; Line 1: Initial definition
+
+(defn process-user [user]         ; Line 2: Uses config
+  (with-timeout (:timeout config)
+    (validate user)))
+
+(defn validate [user]              ; Line 3: Uses process-user
+  (process-user user))
+
+;; Later in REPL...
+(def config {:timeout 60})        ; Redefine config
+```
+
+**What just happened?**
+
+1. `process-user` and `validate` were defined with `:timeout 30` in mind
+2. Redefining `config` to `{:timeout 60}` **mutates** the value those functions see
+3. Every function that depends on `config` (directly or transitively) is now **stale**
+4. The REPL state diverged from the file
+
+**This is a side effect** - you changed the behavior of downstream code without changing that code.
+
+#### The Purity Hierarchy (Dependency-Aware)
+
+Only var assignments with **zero dependents** are truly pure:
+
+```clojure
+;; TRULY PURE (zero dependents):
+(def unused-helper [x] (* x 2))   ; Nothing calls this yet
+;; → Safe to redefine, reorder, experiment with
+
+;; IMPURE (has dependents):
+(def config {:timeout 30})        ; process-user depends on this
+;; → Redefining affects all dependents - side effect!
+
+;; PURE-ISOLATED (no var assignment):
+(comment (+ 1 2 3))               ; Just computation, no mutation
+;; → Always safe, zero impact
+```
+
+#### Query Pattern: Detecting Dependent-Aware Purity
+
+```clojure
+;; For each statement, calculate downstream impact
+'[:find ?stmt ?purity ?dependent-count ?transitive-count
+  :in $ ?stmt-id
+  :where
+  [?stmt :statement/id ?stmt-id]
+  [?stmt :statement/defines-var ?var]
+  
+  ;; Count direct dependents
+  (or-join [?var ?direct-count]
+    (and (not [?usage :usage/callee ?var])
+         [(ground 0) ?direct-count])
+    (and [?usage :usage/callee ?var]
+         [(count-distinct ?usage) ?direct-count]))
+  
+  ;; Count transitive dependents
+  [(transitive-dependent-count ?var) ?transitive-count]
+  
+  ;; Classify purity based on dependents
+  (or-join [?direct-count ?transitive-count ?purity]
+    ;; Zero dependents = pure
+    (and [(= ?direct-count 0) true]
+         [(ground :pure) ?purity])
+    
+    ;; Has dependents = impure (side effect on those dependents)
+    (and [(> ?direct-count 0) true]
+         [(ground :impure-var-with-deps) ?purity]))]
+
+;; Result shows true impact:
+{:statement "(def config {:timeout 30})"
+ :purity :impure-var-with-deps
+ :direct-dependents 5
+ :transitive-dependents 23
+ :side-effect-explanation
+   "Redefining this var will change behavior of 23 downstream functions.
+    This is a side effect even though no I/O occurs."}
+```
+
 ### Critical Query Patterns
 
+#### **Optional: Runtime Call Tracing** (Future Work, High Cost)
+
+**If** we wanted to track actual function invocations (not just definitions), we could:
+
+```clojure
+;; Instrument functions to log calls
+(defn instrument-var [var-sym]
+  (let [original-fn @(resolve var-sym)]
+    (alter-var-root (resolve var-sym)
+      (fn [original]
+        (fn [& args]
+          (record-call! {:var var-sym
+                         :timestamp (System/currentTimeMillis)
+                         :args (str args)  ; Careful: could be huge/sensitive
+                         :caller (current-stack-frame)})
+          (apply original args)))
+      (constantly original-fn))))
+
+;; Query: Was function called after var changed?
+'[:find ?fn ?last-call ?var-change ?is-stale
+  :where
+  [?var :var/fqn ?var-fqn]
+  [?change-event :event/target ?var]
+  [?change-event :event/timestamp ?var-change]
+  
+  ;; Find functions that depend on this var
+  [?fn :var/uses ?var]
+  
+  ;; Find most recent call to function
+  [?call-event :event/type :function-call]
+  [?call-event :event/target ?fn]
+  [?call-event :event/timestamp ?last-call]
+  
+  ;; Was call before or after var change?
+  [(< ?last-call ?var-change) ?is-stale]]
+```
+
+**The Cost**:
+- 📊 **Performance**: 10-100x overhead on every function call
+- 💾 **Memory**: Potentially unbounded event log growth
+- 🔒 **Privacy**: Logging args could capture sensitive data
+- 🐛 **Complexity**: Instrumentation can break metaprogramming, stack traces
+- 🚫 **Adoption barrier**: Most developers won't accept this overhead
+
+**Verdict**: Not for Phase 1-3. Maybe Phase 4 as opt-in feature for specific debugging scenarios.
+
+For now, clj-surveyor focuses on **zero-overhead static analysis** and lets runtime behavior remain opaque.
+
+---
+
 #### 1. **File-vs-Runtime Divergence Detection**
+
+**Two types of divergence to detect**:
+
+1. **Eval order divergence**: REPL evaled statements out of file order
+2. **Value divergence**: REPL var value differs from file definition (ephemeral change)
+
+```clojure
+;; Detect ephemeral changes that will revert on restart
+'[:find ?var ?repl-value ?file-value ?persistence
+  :where
+  ;; Var exists in runtime
+  [?var :var/fqn ?fqn]
+  [?var :var/source ?repl-value]
+  
+  ;; Var has a file definition
+  [?var :var/file ?file-path]
+  
+  ;; Get current file content
+  [(read-file-var ?file-path ?fqn) ?file-value]
+  
+  ;; Compare REPL vs file
+  [(not= ?repl-value ?file-value)]
+  
+  ;; Classify persistence
+  (or-join [?repl-value ?file-value ?persistence]
+    ;; REPL matches file = persistent
+    (and [(= ?repl-value ?file-value)]
+         [(ground :persistent) ?persistence])
+    
+    ;; REPL differs from file = ephemeral
+    (and [(not= ?repl-value ?file-value)]
+         [(ground :ephemeral) ?persistence]))]
+
+;; Result with warnings:
+{:var 'my.app/config
+ :repl-value "{:timeout 9999}"
+ :file-value "{:timeout 30}"
+ :persistence :ephemeral
+ :warning
+   "⚠️  EPHEMERAL CHANGE DETECTED
+    
+    REPL state: {:timeout 9999}
+    File state: {:timeout 30}
+    
+    This change exists only in memory. On restart:
+    - Application will revert to file value {:timeout 30}
+    - Current REPL experiments will be lost
+    - Any dependents using 9999 will break
+    
+    Actions:
+    ✅ Save to file if this change should persist
+    ⚠️  Document as experiment if temporary
+    🔴 Restart will lose this change"}
+
+;; Find all ephemeral changes
+'[:find ?var
+  :where
+  [?var :var/ephemeral? true]]
+```
+
+**Eval Order Divergence** (existing pattern):
+
 ```clojure
 ;; Find namespaces where runtime state differs from file order
 '[:find ?ns ?file-order ?actual-order ?divergence
@@ -388,35 +863,216 @@ Enhanced with **confidence propagation** and **eval order tracking**:
    :message "File contains helper fn but never evaled in REPL"}]}
 ```
 
-#### 2. **Side-Effect Detection**
+#### 2. **Cascade Decision Support** (NEW)
+
+**The Core Question**: After an eval event, which dependents should be re-evaled?
+
+**Critical Limitation**: We can detect **potential** staleness (syntactic dependencies + temporal analysis), but we **cannot know** if functions were actually called or if staleness matters in practice.
+
 ```clojure
-;; Find statements with side effects that were evaled out of order
-'[:find ?stmt ?expected-pos ?actual-pos ?side-effects
+;; Given an eval event, analyze cascade requirements
+;; (Based on static dependencies + temporal analysis)
+'[:find ?dependent ?cascade-priority ?confidence ?reasoning
+  :in $ ?event-id
   :where
-  [?stmt :statement/side-effects ?effects]
-  [(seq ?effects) true]  ; Has side effects
+  [?event :event/id ?event-id]
+  [?event :event/target ?changed-var]
+  [?event :event/timestamp ?change-time]
   
-  [?stmt :statement/position ?expected-pos]
+  ;; Find all dependents (direct and transitive)
+  [?usage :usage/callee ?changed-var]
+  [?usage :usage/caller ?dependent]
+  [?dependent :var/fqn ?dep-fqn]
+  
+  ;; Check if dependent was RE-EVALED (not called!) after the change
+  ;; NOTE: We track definitions, not invocations
+  (or-join [?dependent ?change-time ?is-stale]
+    ;; No re-eval since change = POTENTIALLY stale
+    (and (not [?dep-event :event/target ?dependent]
+              [?dep-event :event/timestamp ?dep-time]
+              [(> ?dep-time ?change-time)])
+         [(ground true) ?is-stale])
+    
+    ;; Re-evaled after change = POTENTIALLY fresh
+    ;; (But might still have stale closures if called before re-eval!)
+    (and [?dep-event :event/target ?dependent]
+         [?dep-event :event/timestamp ?dep-time]
+         [(> ?dep-time ?change-time)]
+         [(ground false) ?is-stale]))
+  
+  ;; Analyze the change type
   [?event :event/statement ?stmt]
-  [?event :event/sequence-id ?actual-seq]
-  [(position-from-sequence ?actual-seq) ?actual-pos]
+  [?stmt :statement/purity ?purity]
+  [?changed-var :var/arglists ?old-args]  ; From before change
   
-  [(not= ?expected-pos ?actual-pos)]
-  [(= ?side-effects ?effects)]]
+  ;; Calculate cascade priority based on:
+  ;; 1. Was dependent re-evaled? (not called, evaled!)
+  ;; 2. What kind of change was it?
+  ;; 3. How central is the dependent?
+  [(cascade-priority ?is-stale ?purity ?old-args) ?priority]
+  [(cascade-confidence ?purity ?is-stale) ?confidence]
+  [(cascade-reasoning ?is-stale ?purity) ?reasoning]]
 
-;; UI Display:
-⚠️  Side-effectful statements evaled out of order:
-
-1. (def config (read-config))     Expected: pos 1, Actual: pos 3
-   Side effects: [:io]
-   Risk: Config read AFTER process fn defined - process may use stale data
-
-2. (alter-var-root #'config ...)  Expected: pos 3, Actual: pos 2
-   Side effects: [:var-mutation]
-   Risk: Config mutated before process fn defined
+;; Example result:
+{:changed-var 'my.app/config
+ :dependents
+ [{:var 'my.app/process-user
+   :cascade-priority :high
+   :confidence 0.6  ; NOTE: Lower than before - we don't know if it was CALLED
+   :reasoning "Dependent not re-evaled since config changed. 
+               CAVEAT: We don't know if process-user was called after the change,
+               or if it captured the old config value. Static analysis only."
+   :recommendation "Re-eval process-user to be safe"}
+  
+  {:var 'my.app/validate
+   :cascade-priority :medium
+   :confidence 0.4
+   :reasoning "config change was pure var assignment. validate might be unaffected.
+               CAVEAT: If validate was called and closed over old config, 
+               it could have stale references we can't detect."
+   :recommendation "Check if validate uses changed config keys, or just re-eval to be safe"}
+  
+  {:var 'my.handlers/api
+   :cascade-priority :low
+   :confidence 0.3
+   :reasoning "api was re-evaled after config change, so DEFINITION is fresh.
+               CAVEAT: If api was previously called and returned closures,
+               those closures could still reference old config.
+               We can't track runtime invocations."
+   :recommendation "Definition is fresh, but watch for stale closures in running system"}]
+ 
+ :summary
+   "3 dependents found. Priority based on re-eval timing, NOT runtime calls.
+    
+    ⚠️  IMPORTANT LIMITATIONS:
+    - We track var DEFINITIONS, not function INVOCATIONS
+    - Cannot detect if functions were called before/after change
+    - Cannot track values captured in closures or objects
+    - Staleness analysis is POTENTIAL, not definitive
+    
+    Safest: Re-eval all 3 + reload dependent namespaces
+    Pragmatic: Re-eval process-user, test the others, monitor behavior
+    Risky: Trust that re-evaled definitions are enough (ignores runtime state)
+    
+    When in doubt: Restart the application for guaranteed fresh state.
+                   REPL restart refreshes definitions but not running 
+                   app state (web servers, database connections, caches,
+                   long-lived objects with captured closures, etc.)"}
 ```
 
-#### 3. **Missing Forward Declarations**
+**UI Pattern: Post-Eval Cascade Advisor**
+```
+✅ Evaluated: (def config {:timeout 60})
+
+⚠️  Impact Analysis (Static Dependencies Only):
+    5 direct dependents, 23 transitive dependents
+    
+    NOTE: We track definitions, not runtime calls.
+          Can't know if functions were actually invoked.
+
+🔴 HIGH PRIORITY (definition not refreshed):
+    • my.app/process-user - Not re-evaled since config changed
+    • my.app/validate     - Not re-evaled since config changed
+    
+    ⚠️  CAVEAT: Even if never called, re-eval ensures definition is fresh
+    
+    Recommendation: Re-eval these 2 functions
+
+🟡 MEDIUM PRIORITY (definition might be stale):
+    • my.handlers/create  - Evaled BEFORE config change
+    • my.utils/format     - Transitively depends on process-user
+    
+    ⚠️  CAVEAT: If called before config change, may have captured old value
+    
+    Recommendation: Re-eval or run tests to verify behavior
+
+🟢 LOW PRIORITY (definition refreshed):
+    • my.api/handler      - Re-evaled AFTER config change
+    
+    ⚠️  CAVEAT: Definition is fresh, but if previously called and 
+                returned closures/objects, those may still reference 
+                old config. We can't track runtime state.
+    
+    Recommendation: Definition OK, but monitor for stale runtime references
+
+💡 Quick fixes:
+   • Re-eval all 23 dependents (safest for definitions, most work)
+   • Reload entire namespace (re-establishes file order)
+   • Restart REPL (guaranteed fresh definitions, loses session state)
+   • **Restart application** (guaranteed fresh runtime state, clears all objects/closures)
+   
+⚠️  Remember: This analysis is based on static dependencies and 
+             eval timestamps. We don't know what was CALLED, only 
+             what was DEFINED. When critical, restart the application
+             for guaranteed fresh state - REPL restart only refreshes
+             definitions, not running application state (servers, 
+             connections, cached objects, etc.).
+```
+
+#### 3. **Side-Effect Detection**
+```clojure
+;; Find all vars affected by evaluating a statement
+;; (dependency-aware side-effect propagation)
+'[:find ?dependent-var ?impact-type ?path-length
+  :in $ ?stmt-id
+  :where
+  [?stmt :statement/id ?stmt-id]
+  [?stmt :statement/defines-var ?var]
+  [?var :var/fqn ?fqn]
+  
+  ;; Direct assignment side effect
+  [(ground :direct-mutation) ?direct-impact]
+  
+  ;; Find all vars that depend on this var (transitively)
+  (or-join [?fqn ?dependent-fqn ?impact-type ?path-length]
+    ;; Zero dependents = truly pure
+    (and (not [?usage :usage/callee ?var])
+         [(ground :none) ?impact-type]
+         [(ground 0) ?path-length])
+    
+    ;; Has dependents = side effect propagation
+    (and [?usage :usage/callee ?var]
+         [?usage :usage/caller ?dependent-var]
+         [?dependent-var :var/fqn ?dependent-fqn]
+         [(ground :dependent-mutation) ?impact-type]
+         [(ground 1) ?path-length])
+    
+    ;; Transitive dependents
+    (and (transitive-deps ?fqn ?dependent-fqn ?depth)
+         [(ground :transitive-mutation) ?impact-type]
+         [(= ?path-length ?depth)]))]
+
+;; Result:
+{:statement "(def config 42)"
+ :purity :impure-var-with-deps
+ :direct-dependents 5
+ :transitive-dependents 23
+ :impact-summary
+   "This assignment affects 23 vars total:
+    - 5 direct users of config
+    - 18 functions that transitively depend on config
+    
+    All 23 vars are now stale and may need re-evaluation."
+ :ui-warning
+   "⚠️  Redefining config will affect 23 functions
+    💡 Consider: Is this intended? Should you reload dependents?"}
+```
+
+**Critical Query: Zero-Dependency Detection**
+```clojure
+;; Find truly pure var assignments (zero dependents)
+'[:find ?stmt ?var
+  :where
+  [?stmt :statement/defines-var ?var]
+  [?var :var/fqn ?fqn]
+  
+  ;; No usages = pure assignment
+  (not [?usage :usage/callee ?var])]
+
+;; These are safe to eval/reorder without side effects
+```
+
+#### 4. **Missing Forward Declarations**
 ```clojure
 ;; Find vars that could benefit from forward declarations
 '[:find ?stmt ?missing-declare ?used-before-defined
@@ -446,29 +1102,73 @@ Add forward declarations to enable safe reordering:
 This allows REPL experimentation without order constraints.
 ```
 
-#### 4. **Reorder Safety Analysis**
+#### 5. **Reorder Safety Analysis**
 ```clojure
 ;; Which statements can be safely reordered?
-'[:find ?stmt ?reorder-safe?
+;; (Dependency-aware purity check)
+'[:find ?stmt ?reorder-safe? ?blocker-reason
   :where
   [?stmt :statement/type ?type]
-  
-  ;; Check purity
   [?stmt :statement/purity ?purity]
-  [?stmt :statement/side-effects ?effects]
+  [?stmt :statement/defines-var ?var]
   
-  ;; Check if all dependencies could be forward-declared
-  [?stmt :statement/depends-on ?deps]
-  [(all-declarable? ?deps) ?all-decl]
+  ;; Check for dependents
+  (or-join [?var ?has-deps]
+    (and [?usage :usage/callee ?var]
+         [(ground true) ?has-deps])
+    (and (not [?usage :usage/callee ?var])
+         [(ground false) ?has-deps]))
   
-  ;; Safe if pure OR pure-with-declares AND no side effects
-  [(or (= ?purity :pure)
-       (and (= ?purity :pure-with-forward-declare)
-            ?all-decl
-            (empty? ?effects))) ?reorder-safe?]]
+  ;; Safe if:
+  ;; 1. Pure-isolated (no var assignment)
+  ;; 2. Pure with zero dependents
+  ;; 3. Pure-with-forward-declare AND has forward declares
+  (or-join [?purity ?has-deps ?reorder-safe? ?blocker-reason]
+    ;; Case 1: Pure isolated
+    (and [(= ?purity :pure-isolated) true]
+         [(ground true) ?reorder-safe?]
+         [(ground nil) ?blocker-reason])
+    
+    ;; Case 2: Var definition with zero dependents
+    (and [(= ?purity :pure) true]
+         [(false? ?has-deps) true]
+         [(ground true) ?reorder-safe?]
+         [(ground nil) ?blocker-reason])
+    
+    ;; Case 3: Would be pure with forward declares
+    (and [(= ?purity :pure-with-forward-declare) true]
+         [?stmt :statement/forward-declares-needed ?decls]
+         [(all-present? ?decls) true]
+         [(ground true) ?reorder-safe?]
+         [(ground nil) ?blocker-reason])
+    
+    ;; Case 4: Has dependents = NOT safe
+    (and [(contains? #{:impure-var-with-deps :impure-var-unknown-deps} ?purity) true]
+         [(ground false) ?reorder-safe?]
+         [(count-dependents ?var) ?dep-count]
+         [(str "Affects " ?dep-count " dependent vars") ?blocker-reason])
+    
+    ;; Case 5: Other impurity
+    (and [(= ?purity :impure-known) true]
+         [(ground false) ?reorder-safe?]
+         [?stmt :statement/side-effects ?effects]
+         [(str "Side effects: " ?effects) ?blocker-reason]))]
+
+;; Result with detailed reasoning:
+{:statement "(def config (read-config))"
+ :reorder-safe? false
+ :blocker-reason "Affects 5 dependent vars"
+ :recommendation
+   "This var has dependents - reordering will cause staleness.
+    If you must reorder, re-eval all 5 dependents after:
+    - my.app/process-user
+    - my.app/validate
+    - my.app/handler
+    - my.utils/check
+    - my.utils/format"}
 ```
 
-#### 5. **Session Reproducibility Check**
+#### 6. **Session Reproducibility Check**
 ```clojure
 ;; Can I reproduce my current REPL state by reloading the file?
 '[:find ?ns ?reproducible? ?blocking-issues
@@ -502,21 +1202,74 @@ This allows REPL experimentation without order constraints.
 
 ### UI Patterns for File/Statement Issues
 
-**Real-time Warning in Editor**:
+**Real-time Warning in Editor** (with persistence tracking):
 ```
 my/app.clj [⚠️ Runtime divergence detected]
+
+Line 10: (def config {:timeout 30})
+         🔴 REPL VALUE DIFFERS: {:timeout 9999}
+         ⚠️  EPHEMERAL CHANGE - will revert to 30 on restart
+         💾 Save current REPL value to file? [Yes] [No] [Ignore]
+         
+         ⚠️  5 functions depend on config
+         🔴 Redefining config will make dependents stale
+         💡 After eval, consider reloading: process-user, validate, handler
 
 Line 15: (defn process [x] (helper x))
          ⚠️  Calls 'helper' before it's defined (line 20)
          💡 Add: (declare helper) at line 10
          🔴 REPL evaled this BEFORE helper was defined - may fail on reload
 
+Line 18: (def internal-const 42)
+         ✅ Zero dependents - safe to reorder/redefine
+         ✅ File and REPL in sync
+         
 Line 20: (defn helper [x] (* x 2))
-         ✅ Definition matches REPL state
+         ⚠️  23 functions transitively depend on helper
+         🔴 Redefining helper affects 23 vars total
+         ✅ File and REPL in sync
+         💡 Consider: Is this change isolated to testing?
          
 Line 25: (alter-var-root #'config assoc :timeout 5000)
+         🔴 Mutates config (5 direct dependents, 23 transitive)
          ⚠️  REPL skipped this statement
          🔴 File config differs from runtime config
+```
+
+**REPL Status Bar**:
+```
+📊 Surveyor: 47 vars tracked | 3 ephemeral changes | 2 diverged from file
+    
+    Click for details →
+```
+
+**Ephemeral Changes Panel**:
+```
+⚠️  EPHEMERAL CHANGES (will be lost on restart):
+
+1. my.app/config
+   File:  {:timeout 30}
+   REPL:  {:timeout 9999}
+   Age:   2m 15s
+   Impact: 5 direct deps, 23 transitive deps
+   [Save to File] [Revert to File] [Keep Ephemeral]
+
+2. my.utils/debug-mode?
+   File:  false
+   REPL:  true
+   Age:   15s
+   Impact: 0 deps
+   [Save to File] [Revert to File] [Keep Ephemeral]
+
+3. my.handlers/experimental-handler
+   File:  <not in file>
+   REPL:  (defn experimental-handler ...)
+   Age:   5m 42s
+   Impact: 1 dep (called by router)
+   [Add to File] [Delete from REPL]
+   
+💡 Total: 3 ephemeral changes affecting 24 vars
+   Consider: Save useful changes, revert experiments
 ```
 
 **Pre-Reload Sanity Check**:
@@ -525,15 +1278,33 @@ About to reload my.app namespace...
 
 Checking for issues:
 ✅ No missing forward declarations
-⚠️  3 statements have side effects
-   → (def config (read-config))  [re-runs I/O]
-   → (defonce db (create-db))    [won't re-run due to defonce]
+⚠️  3 var assignments with dependents:
+   → (def config ...)         [5 direct, 23 transitive dependents]
+   → (def helper ...)         [2 direct, 8 transitive dependents]
+   → (defn process ...)       [12 direct, 47 transitive dependents]
+   
+   All dependents will become stale after reload.
+   Recommend: Reload dependent namespaces too
+
+⚠️  2 statements have I/O side effects:
+   → (def config (read-config))  [re-runs I/O, may get different value]
    → (println "Loading...")      [will print again]
 
-❌ 2 out-of-order dependencies detected
+⚠️  1 statement uses defonce:
+   → (defonce db (create-db))    [won't re-run, keeps old state]
+
+❌ 2 out-of-order dependencies detected:
    → process uses helper before helper defined
 
-Recommendation: Fix order issues before reloading
+Recommendation: 
+1. Fix order issues before reloading
+2. After reload, consider refreshing 62 dependent vars across 4 namespaces
+
+Affected namespaces:
+- my.app (23 vars stale)
+- my.handlers (15 vars stale)
+- my.utils (18 vars stale)
+- my.api (6 vars stale)
 ```
 
 ## Enhanced Use Cases (Feedback-Informed)
@@ -681,6 +1452,11 @@ Recommendation: Fix order issues before reloading
    :entity/staleness-ms   {:db/index true}
    :entity/version        {:db/index true}
    
+   ;; Persistence tracking (NEW: ephemeral vs. persistent changes)
+   :var/file-backed?   {:db/index true}    ; Defined in a file?
+   :var/ephemeral?     {:db/index true}    ; REPL-only, lost on restart?
+   :var/file-diverged? {:db/index true}    ; REPL differs from file?
+   
    ;; Composite indexes for common queries (performance optimization)
    :entity/type+confidence {:db/index true}  ; "find high-confidence vars"
    
@@ -700,6 +1476,32 @@ Recommendation: Fix order issues before reloading
    :event/type      {:db/index true}
    :event/target    {:db/valueType :db.type/ref :db/index true}
    :event/timestamp {:db/index true}
+   :event/source    {:db/index true}  ; :repl-eval, :file-load, :ns-reload
+   
+   ;; Persistence tracking (NEW: ephemeral vs. persistent)
+   :event/persistent?  {:db/index true}  ; Saved to file?
+   :event/file-backed  {:db/index true}  ; File path if persistent
+   :event/ephemeral?   {:db/index true}  ; REPL-only, reverts on restart
+   
+   ;; File-load events (NEW)
+   :event/file      {:db/index true}
+   :event/statements {:db/valueType :db.type/ref
+                      :db/cardinality :db.cardinality/many}
+   :event/eval-order {:db/cardinality :db.cardinality/many}
+   
+   ;; Statement-eval events (NEW)
+   :event/statement {:db/valueType :db.type/ref}
+   :event/position  {:db/index true}
+   :event/out-of-order? {:db/index true}
+   
+   ;; Impact tracking (NEW: cascade decision support)
+   :event/affected-vars {:db/valueType :db.type/ref
+                         :db/cardinality :db.cardinality/many}
+   :event/stale-dependents {:db/index true}       ; count
+   :event/cascade-needed? {:db/index true}        ; bool
+   :event/cascade-confidence {:db/index true}     ; 0.0-1.0
+   
+   ;; Causality tracking
    :event/triggered-by {:db/valueType :db.type/ref}  ; causality
    :event/cascade-depth {:db/index true}              ; nth-order effects
    :event/sequence-id   {:db/index true}              ; temporal ordering
@@ -730,7 +1532,8 @@ Recommendation: Fix order issues before reloading
    :statement/depends-on {:db/valueType :db.type/ref
                           :db/cardinality :db.cardinality/many}
    :statement/side-effects {:db/cardinality :db.cardinality/many}  ; set of keywords
-   :statement/purity {:db/index true}  ; :pure, :pure-with-forward-declare, :impure
+   :statement/purity {:db/index true}  ; :pure-isolated, :pure, :pure-with-forward-declare, :impure-var-with-deps, :impure-known
+   :statement/downstream-impact {:db/index true}  ; count of affected vars (NEW)
    :statement/position {:db/index true}  ; position in file
    :statement/must-follow {:db/valueType :db.type/ref
                            :db/cardinality :db.cardinality/many}
