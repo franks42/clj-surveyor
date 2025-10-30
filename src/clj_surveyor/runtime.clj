@@ -166,6 +166,83 @@
              {}
              ns-analyses))))
 
+(defn get-cascade-impact
+  "Find all vars transitively affected by changing the target var.
+   'If I change this function, what breaks?'
+   
+   Returns a map with:
+   - :target-var - the var being changed
+   - :cascade - seq of {:var fqn :depth N :path [...]} for each affected var
+   - :total-impact - total count of affected vars
+   - :max-depth - deepest level of cascade
+   
+   Options:
+   - :max-depth - limit cascade depth (default 10 to prevent infinite loops)
+   - :graph - pre-built dependency graph (will build if not provided)
+   - :ns-filter - namespace filter for graph building
+   
+   Example:
+   (get-cascade-impact \"my.ns/foo\")
+   => {:target-var \"my.ns/foo\"
+       :cascade [{:var \"my.ns/bar\" :depth 1 :path [\"my.ns/foo\" \"my.ns/bar\"]}
+                 {:var \"my.ns/baz\" :depth 2 :path [\"my.ns/foo\" \"my.ns/bar\" \"my.ns/baz\"]}]
+       :total-impact 2
+       :max-depth 2}"
+  ([target-var-fqn] (get-cascade-impact target-var-fqn {}))
+  ([target-var-fqn {:keys [max-depth graph ns-filter] :or {max-depth 10}}]
+   (let [dep-graph (or graph (build-dependency-graph (when ns-filter {:ns-filter ns-filter})))
+         ;; Breadth-first traversal to find all affected vars with depth tracking
+         cascade (loop [to-visit [{:var target-var-fqn :depth 0 :path [target-var-fqn]}]
+                       visited #{}
+                       results []]
+                  (if (empty? to-visit)
+                    results
+                    (let [{:keys [var depth path] :as current} (first to-visit)
+                          rest-to-visit (rest to-visit)]
+                      (if (or (visited var) (>= depth max-depth))
+                        ;; Already visited or max depth reached - skip
+                        (recur rest-to-visit visited results)
+                        ;; Find dependents and add to queue
+                        (let [dependents (get-in dep-graph [var :dependents] #{})
+                              new-depth (inc depth)
+                              new-to-visit (map (fn [dep]
+                                                 {:var dep
+                                                  :depth new-depth
+                                                  :path (conj path dep)})
+                                               dependents)
+                              new-results (if (pos? depth)  ;; Don't include the target itself
+                                           (conj results current)
+                                           results)]
+                          (recur (concat rest-to-visit new-to-visit)
+                                (conj visited var)
+                                new-results))))))]
+     {:target-var target-var-fqn
+      :cascade cascade
+      :total-impact (count cascade)
+      :max-depth (if (empty? cascade) 0 (apply max (map :depth cascade)))})))
+
+(defn print-cascade
+  "Pretty-print cascade impact in a tree structure.
+   Shows the ripple effect visually with indentation."
+  [cascade-result]
+  (let [{:keys [target-var cascade total-impact max-depth]} cascade-result]
+    (println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    (println "CASCADE IMPACT ANALYSIS")
+    (println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    (println (str "Target: " target-var))
+    (println (str "Total Impact: " total-impact " vars affected"))
+    (println (str "Max Depth: " max-depth " levels"))
+    (println "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    (if (zero? total-impact)
+      (println "✓ No cascade impact - safe to change!")
+      (do
+        (println "\nRipple Effect:")
+        (doseq [{:keys [var depth]} (sort-by (juxt :depth :var) cascade)]
+          (let [indent (apply str (repeat (* 2 depth) " "))
+                arrow (if (= depth 1) "→" "↳")]
+            (println (str indent arrow " " var " (depth " depth ")"))))
+        (println "\n" total-impact "vars would be affected by this change.")))))
+
 (defn runtime-snapshot
   "Capture a snapshot of the current runtime state.
    Phase 0: Basic counts and namespace list."
@@ -196,6 +273,14 @@
   
   ;; Build graph for specific namespaces only
   (build-dependency-graph {:ns-filter #"^clj-surveyor"})
+  
+  ;; Cascade impact analysis - "what breaks if I change this?"
+  (def impact (get-cascade-impact "test.demo-file/helper-fn"))
+  (print-cascade impact)
+  ;; Shows all vars affected transitively
+  
+  ;; See the scary truth about core functions
+  (print-cascade (get-cascade-impact "clojure.core/map" {:ns-filter #"^clj-surveyor"}))
   
   ;; Get namespace summary
   (namespace-summary "clojure.core")
