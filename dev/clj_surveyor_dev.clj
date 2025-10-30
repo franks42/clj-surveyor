@@ -7,7 +7,9 @@
     ;; clj-ns-browser (local) provides UI helpers
     [clj-ns-browser.core :as nsb]
     ;; nREPL server - provided by the environment; if missing, starting REPL may still work
-    [nrepl.server :as nrepl]))
+    [nrepl.server :as nrepl]
+    ;; surveyor middleware for runtime introspection
+    [clj-surveyor.middleware :as surveyor-mw]))
 
 (defonce ^:private server-atom (atom nil))
 
@@ -23,19 +25,22 @@
         (log/error t "Failed to start clj-ns-browser UI")))))
 
 (defn start-nrepl
-  "Start an nREPL server on the given port (default 7888). Returns server instance.
-   If a server is already running (via this helper) it will be returned instead of starting a new one." 
+  "Start an nREPL server on the given port (default 7888) with surveyor middleware.
+   Returns server instance. If a server is already running (via this helper) it will be returned
+   instead of starting a new one." 
   ([] (start-nrepl 7888))
   ([port]
    (if-let [s @server-atom]
      (do (log/info "nREPL server already running") s)
-     (let [s (nrepl/start-server :port port)]
+     (let [s (nrepl/start-server :port port
+                                 :handler (nrepl/default-handler #'surveyor-mw/wrap-surveyor))]
        (reset! server-atom s)
-       (log/info "Started nREPL server on port" port)
+       (log/info "Started nREPL server on port" port "with surveyor middleware")
        s))))
 
 (defn stop-nrepl
-  "Stop the nREPL server started with start-nrepl (if any)." []
+  "Stop the nREPL server started with start-nrepl (if any)."
+  []
   (when-let [s @server-atom]
     (try
       (nrepl/stop-server s)
@@ -57,4 +62,4 @@
                 (catch Throwable t
                   (log/error t "Could not start nREPL server; maybe port in use")
                   nil))]
-     {:ui ui-f :nrepl repl}))
+     {:ui ui-f :nrepl repl})))

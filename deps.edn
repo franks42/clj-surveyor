@@ -1,5 +1,19 @@
-{:paths ["src" "dev" "tmp/clj-ns-browser-master" "tmp/clj-info-master"]
- :deps {clj-ns-browser/clj-ns-browser {:local/root "tmp/clj-ns-browser-master"}
-        clj-info/clj-info             {:local/root "tmp/clj-info-master"}}
- :aliases {:dev {:extra-paths ["dev"]}}
+{:paths ["src" "dev"]
+ :deps {nrepl/nrepl                   {:mvn/version "1.3.0"}
+        org.clojure/tools.logging     {:mvn/version "1.3.0"}
+        ;; Local source paths for clj-ns-browser and clj-info
+        javax.xml.bind/jaxb-api       {:mvn/version "2.4.0-b180830.0359"}
+        org.clojure/clojure           {:mvn/version "1.12.0"}
+        seesaw/seesaw                 {:mvn/version "1.5.0"}
+        org.clojure/tools.namespace   {:mvn/version "1.5.0"}
+        org.clojure/tools.trace       {:mvn/version "0.8.0"}
+        clojure-complete/clojure-complete {:mvn/version "0.2.5" :exclusions [org.clojure/clojure]}
+        hiccup/hiccup                 {:mvn/version "2.0.0"}
+        io.aviso/pretty               {:mvn/version "1.4.4"}
+        org.clojure/data.json         {:mvn/version "2.5.1"}
+        org.babashka/http-client      {:mvn/version "0.4.22"}}
+ :aliases {:dev {:extra-paths ["dev" 
+                               "tmp/clj-ns-browser-master/src"
+                               "tmp/clj-ns-browser-master/src-java"
+                               "tmp/clj-info-master/src"]}}
 }
