@@ -59,14 +59,12 @@
                             (slurp file)))))]
       ;; Analyze with clj-kondo if we have code
       (when code-str
-        ;; clj-kondo expects stdin input, so we write to a temp file
-        (let [temp-file (java.io.File/createTempFile "clj-surveyor-" ".clj")
-              _ (spit temp-file code-str)
-              result (kondo/run! {:lint [(.getAbsolutePath temp-file)]
-                                  :config {:output {:analysis {:var-usages true
-                                                               :var-definitions true}}}})]
-          (.delete temp-file)
-          (:analysis result))))
+        ;; Use stdin to avoid temp file - clj-kondo reads from *in* when linting "-"
+        (with-in-str code-str
+          (let [result (kondo/run! {:lint ["-"]
+                                    :config {:output {:analysis {:var-usages true
+                                                                 :var-definitions true}}}})]
+            (:analysis result)))))
     (catch Exception _
       nil)))
 
