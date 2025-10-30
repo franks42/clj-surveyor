@@ -1,6 +1,7 @@
 {:paths ["src" "dev"]
  :deps {nrepl/nrepl                   {:mvn/version "1.3.0"}
         org.clojure/tools.logging     {:mvn/version "1.3.0"}
+        clj-kondo/clj-kondo           {:mvn/version "2024.09.27"}
         ;; Local source paths for clj-ns-browser and clj-info
         javax.xml.bind/jaxb-api       {:mvn/version "2.4.0-b180830.0359"}
         org.clojure/clojure           {:mvn/version "1.12.0"}

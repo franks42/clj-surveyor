@@ -3,7 +3,9 @@
 
 (ns clj-surveyor.runtime
   (:require
-    [clj-ns-browser.utils :as browser-utils]))
+    [clj-ns-browser.utils :as u]
+    [clj-kondo.core :as kondo]
+    [clj-surveyor.middleware :as mw]))
 
 ;; Phase 0: Basic runtime introspection using clj-ns-browser utilities
 
@@ -41,33 +43,75 @@
                        (type @v)
                        (catch Throwable _ nil)))})))
 
+(defn analyze-namespace-code
+  "Use clj-kondo to analyze a namespace's code and return var usage information.
+   Uses code captured by middleware or reads from file."
+  [ns-obj]
+  (try
+    (let [ns-name (ns-name ns-obj)
+          ;; First try to get captured code from middleware
+          code-str (or (mw/get-namespace-code ns-name)
+                      ;; Fallback: try to read from file if vars have :file metadata
+                      (when-let [sample-var (first (vals (ns-interns ns-obj)))]
+                        (when-let [file (:file (meta sample-var))]
+                          (when (and (not= file "NO_SOURCE_PATH")
+                                    (.exists (java.io.File. file)))
+                            (slurp file)))))]
+      ;; Analyze with clj-kondo if we have code
+      (when code-str
+        (let [result (kondo/run! {:lint ["-"]
+                                  :lang :clj
+                                  :cache false
+                                  :config {:output {:analysis {:var-usages true
+                                                               :var-definitions true}}}
+                                  :stdin code-str})]
+          (:analysis result))))
+    (catch Exception _
+      nil)))
+
 (defn find-var-usages
-  "Find where a var is used by scanning the source of other vars.
-   Phase 0 stub: only checks if var is referenced in other var metadata.
-   Returns seq of {:user-fqn :ref-type} maps."
+  "Find all vars that reference the target var using clj-kondo analysis.
+   
+   Phase 0 approach: Analyze namespace code with clj-kondo.
+   LIMITATION: Requires source code - works for file-based or middleware-tracked code.
+   Returns seq of {:user-fqn ... :ref-type ... :from-var ... :to-var ...}
+   Confidence: :high (static analysis)"
   [target-var]
-  (let [target-sym (.sym target-var)]
-    (->> (all-vars)
-         (keep (fn [v]
-                 (let [m (meta v)]
-                   ;; Check :arglists, :doc for mentions (crude heuristic for Phase 0)
-                   (when (or (and (:doc m) (re-find (re-pattern (str target-sym)) (:doc m)))
-                             (some #(some #{target-sym} (flatten %)) (:arglists m)))
-                     {:user-fqn (var-fqn v)
-                      :ref-type :possible-usage}))))
-         (take 100)))) ;; Limit for Phase 0
+  (let [target-fqn (var-fqn target-var)
+        target-ns (.ns target-var)
+        target-name (symbol (name target-fqn))]
+    ;; Analyze the namespace with clj-kondo
+    (when-let [analysis (analyze-namespace-code target-ns)]
+      (->> (get-in analysis [:var-usages])
+           (filter (fn [usage]
+                     ;; Match usages of our target var
+                     (and (= (:to usage) target-name)
+                          (= (:to-ns usage) (ns-name target-ns)))))
+           (map (fn [usage]
+                  {:user-fqn (str (:from-ns usage) "/" (:from usage))
+                   :ref-type :call
+                   :from-var (:from usage)
+                   :to-var (:to usage)
+                   :row (:row usage)
+                   :col (:col usage)}))
+           (take 100))))) ;; Limit for Phase 0
 
 (defn get-var-dependents
-  "Get vars that likely depend on the target var.
-   Phase 0: Uses metadata scanning. Future: static analysis + runtime tracking."
-  [var-name]
-  (when-let [v (browser-utils/resolve-fqname var-name)]
-    (when (var? v)
-      {:target-var (var-fqn v)
-       :dependents (find-var-usages v)
-       :count (count (find-var-usages v))
-       :confidence :low  ;; Phase 0 uses heuristics only
-       :method :metadata-scan})))
+  "Get all vars that depend on (reference) the target var.
+   Args: target-var-fqn (string like 'clojure.core/map')
+   Returns: {:target-var ... :dependents [...] :count N :confidence :low|:medium|:high :method ...}"
+  [target-var-fqn]
+  (if-let [target-var (u/resolve-fqname target-var-fqn)]
+    (let [deps (find-var-usages target-var)]
+      {:target-var target-var-fqn
+       :dependents deps
+       :count (count deps)
+       :confidence :high  ;; clj-kondo static analysis
+       :method :clj-kondo-analysis})
+    {:target-var target-var-fqn
+     :error "Could not resolve var"
+     :dependents []
+     :count 0}))
 
 (defn namespace-summary
   "Get summary of a namespace: var count, public/private breakdown, types."
