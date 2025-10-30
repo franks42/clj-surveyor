@@ -59,12 +59,13 @@
                             (slurp file)))))]
       ;; Analyze with clj-kondo if we have code
       (when code-str
-        (let [result (kondo/run! {:lint ["-"]
-                                  :lang :clj
-                                  :cache false
+        ;; clj-kondo expects stdin input, so we write to a temp file
+        (let [temp-file (java.io.File/createTempFile "clj-surveyor-" ".clj")
+              _ (spit temp-file code-str)
+              result (kondo/run! {:lint [(.getAbsolutePath temp-file)]
                                   :config {:output {:analysis {:var-usages true
-                                                               :var-definitions true}}}
-                                  :stdin code-str})]
+                                                               :var-definitions true}}}})]
+          (.delete temp-file)
           (:analysis result))))
     (catch Exception _
       nil)))
@@ -82,19 +83,20 @@
         target-name (symbol (name target-fqn))]
     ;; Analyze the namespace with clj-kondo
     (when-let [analysis (analyze-namespace-code target-ns)]
-      (->> (get-in analysis [:var-usages])
-           (filter (fn [usage]
-                     ;; Match usages of our target var
-                     (and (= (:to usage) target-name)
-                          (= (:to-ns usage) (ns-name target-ns)))))
-           (map (fn [usage]
-                  {:user-fqn (str (:from-ns usage) "/" (:from usage))
-                   :ref-type :call
-                   :from-var (:from usage)
-                   :to-var (:to usage)
-                   :row (:row usage)
-                   :col (:col usage)}))
-           (take 100))))) ;; Limit for Phase 0
+      (let [var-usages (:var-usages analysis)]
+        (->> var-usages
+             (filter (fn [usage]
+                       ;; Match usages of our target var
+                       (and (= (:name usage) target-name)
+                            (= (:to usage) (ns-name target-ns)))))
+             (map (fn [usage]
+                    {:user-fqn (str (:from usage) "/" (:from-var usage))
+                     :ref-type :call
+                     :from-var (:from-var usage)
+                     :to-var (:name usage)
+                     :row (:row usage)
+                     :col (:col usage)}))
+             (take 100)))))) ;; Limit for Phase 0
 
 (defn get-var-dependents
   "Get all vars that depend on (reference) the target var.
