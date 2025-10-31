@@ -10,6 +10,8 @@
 - ✅ clj-kondo integration for high-confidence dependency analysis
 - ✅ In-memory analysis (no temp files)
 - ✅ Full runtime dependency graph builder
+- ✅ **MCP-nREPL integration** (25-100x performance gain) - See [doc/mcp-nrepl-integration.md](doc/mcp-nrepl-integration.md)
+- ✅ **Comprehensive analysis framework** (cascade impact, refactoring metrics, stale code detection)
 - 🚧 Moving toward Phase 1 (Datascript entity graph)
 
 ## What We're Building
@@ -164,6 +166,35 @@ This dynamic nature is both Clojure's strength and the source of analysis challe
   ;;     ...}
   ```
 
+**`get-cascade-impact [var-fqn opts]`** ⭐ NEW
+- Analyze transitive dependents (upward cascade)
+- BFS traversal with depth tracking
+- Returns: `{:target-var ... :total-impact N :max-depth N :cascade-tree [...]}`
+- Shows blast radius of changes
+- Example:
+  ```clojure
+  (get-cascade-impact "my.ns/foo" {:graph graph})
+  ;; => {:total-impact 7 :max-depth 3 :cascade-tree [...]}
+  ```
+
+**`refactoring-metrics [graph var-name]`** ⭐ NEW
+- Analyze refactoring opportunities based on dependency count
+- Calculates complexity score (weighted by dep type)
+- Returns: `{:priority :high/:medium/:low :reason "..." :refactorable? true/false}`
+- Example:
+  ```clojure
+  (refactoring-metrics graph "my.ns/complex-fn")
+  ;; => {:total-deps 17 :core-deps 15 :priority :high :refactorable? true}
+  ```
+
+**`find-stale-functions [graph ns-pattern]`** ⭐ NEW
+- Find functions with zero dependents (potential dead code)
+- Example:
+  ```clojure
+  (find-stale-functions graph #"^my-project")
+  ;; => [{:var "my.ns/unused-fn" :dependents 0}]
+  ```
+
 **Other Utilities**:
 - `all-vars` - Get all vars, optionally filtered by namespace pattern
 - `var-info` - Extract metadata about a var
@@ -231,6 +262,42 @@ This dynamic nature is both Clojure's strength and the source of analysis challe
 See `doc/phase0-test-results.md` for comprehensive testing documentation.
 
 ### Working with the Runtime
+
+#### MCP-nREPL Integration (Recommended) ⭐
+
+**Performance**: 25-100x faster than spawning processes
+
+**Setup**:
+1. Configure MCP server in `~/Library/Application Support/Code/User/mcp.json`
+2. Start nREPL: `clj -M:dev -m nrepl.cmdline --port 7890 &`
+3. Connect via MCP tools
+
+**Usage**:
+```clojure
+;; Connect
+(mcp_nrepl-mcp-ser_nrepl-connection 
+  {:op "connect" :connection "7890" :nickname "analysis"})
+
+;; Evaluate
+(mcp_nrepl-mcp-ser_nrepl-eval 
+  {:code "(build-dependency-graph {:ns-filter #\"^clj-surveyor\"})"
+   :connection "analysis"})
+
+;; Base64 encoding for complex code (no escaping!)
+(mcp_nrepl-mcp-ser_nrepl-eval 
+  {:code "KGRlZm4gZiBbeF0gIigrIHggMSkiKQ=="
+   :input-base64 true
+   :connection "analysis"})
+```
+
+**Advantages**:
+- ✅ Persistent REPL connection (no startup overhead)
+- ✅ No quote escaping issues (base64 support)
+- ✅ Multi-connection support (dev, test, prod)
+- ✅ Timeout protection (1-300s configurable)
+- ✅ Full VS Code API access
+
+See **[doc/mcp-nrepl-integration.md](doc/mcp-nrepl-integration.md)** for complete details.
 
 #### Local REPL Testing
 ```bash
